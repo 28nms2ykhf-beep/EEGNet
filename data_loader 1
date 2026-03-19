@@ -1,0 +1,313 @@
+# data_loader.py
+import os
+import random
+import numpy as np
+import pandas as pd
+import torch
+from torch.utils.data import Dataset
+from sklearn.model_selection import train_test_split, StratifiedKFold
+
+def load_labels(csv_path):
+    """0 is left hemisphere, 1 is right hemisphere"""
+    df = pd.read_csv(csv_path)
+    df = df[['patient', 'session', 'position']]
+    df = df.dropna(subset=['patient', 'session', 'position'])
+    label_dict = {}
+    for _, row in df.iterrows():
+        patient_raw = str(row['patient']).strip()
+        try:
+            patient_num = str(int(float(patient_raw)))
+        except ValueError:
+            patient_num = patient_raw
+        patient_folder = f"patient_{patient_num}"
+        session_raw = str(row['session']).strip()
+        if session_raw.startswith('ses-'):
+            session_folder = session_raw
+        else:
+            session_folder = f"ses-{session_raw}"
+        pos = str(row['position']).strip().upper()
+        label = 0 if pos == 'L' else 1
+        label_dict[(patient_folder, session_folder)] = label
+    print(f"Loaded {len(label_dict)} (patient, session) labels.")
+    left = sum(1 for v in label_dict.values() if v == 0)
+    right = sum(1 for v in label_dict.values() if v == 1)
+    print(f"  Left: {left}, Right: {right}")
+    return label_dict
+
+
+class EEGDataset(Dataset):
+    def __init__(self, data_root, label_dict, samples_per_session=None, allowed_keys=None, samples_list=None):
+        self.data_root = data_root
+        self.label_dict = label_dict
+        self.samples_per_session = samples_per_session
+        self.allowed_keys = set(allowed_keys) if allowed_keys else None
+        self.samples = []
+        if samples_list is not None:
+            self.samples = samples_list
+        else:
+            self._collect_samples()
+        self.filled_count = 0
+        self.total_samples_checked = 0
+
+
+    def _collect_samples(self):
+        patients_found = 0
+        for patient in os.listdir(self.data_root):
+            patient_path = os.path.join(self.data_root, patient)
+            if not os.path.isdir(patient_path):
+                continue
+            patients_found += 1
+            for session in os.listdir(patient_path):
+                session_path = os.path.join(patient_path, session)
+                if not os.path.isdir(session_path):
+                    continue
+                key = (patient, session)
+                if self.allowed_keys and key not in self.allowed_keys:
+                    continue
+                if key not in self.label_dict:
+                    continue
+                label = self.label_dict[key]
+                files = [f for f in os.listdir(session_path) if f.endswith('.pt')]
+                if not files:
+                    continue
+                if self.samples_per_session and len(files) > self.samples_per_session:
+                    files = random.sample(files, self.samples_per_session)
+                for fname in files:
+                    fpath = os.path.join(session_path, fname)
+                    is_seizure = 1 if ('seizure' in fname.lower() or 'sz' in fname.lower()) else 0
+                    self.samples.append((fpath, label, patient, session, is_seizure))
+        print(f"Total samples collected: {len(self.samples)}")
+
+    def __len__(self):
+        return len(self.samples)
+    
+    def forward_fill(self, eeg):
+        eeg = torch.where(torch.isinf(eeg), torch.tensor(float('nan'), device=eeg.device), eeg)
+
+        orig_shape = eeg.shape
+        T = orig_shape[-1]                
+        C = eeg.numel() // T                
+        eeg_2d = eeg.view(C, T)            
+
+        filled = False
+        for c in range(C):
+            channel = eeg_2d[c]
+            nan_mask = torch.isnan(channel)
+            if nan_mask.any():
+                filled = True
+                valid_idx = torch.where(~nan_mask)[0]
+                if len(valid_idx) == 0:    
+                    channel[:] = 0.0
+                else:
+                    last_valid = valid_idx[0].item()
+                    for t in range(T):
+                        if nan_mask[t]:
+                            channel[t] = channel[last_valid]
+                        else:
+                            last_valid = t
+
+        if filled:
+            self.filled_count += 1         
+
+        return eeg_2d.view(orig_shape)     
+        
+
+    def __getitem__(self, idx):
+        item = self.samples[idx]
+        if len(item) >= 5:
+            fpath, label, patient, session, is_seizure = item[:5]
+        else:
+            fpath, label, patient, session = item
+            is_seizure = 0
+        aug_params = item[5] if len(item) >= 6 else None
+        
+        try:
+            eeg = torch.load(fpath).float()
+            
+            eeg = self.forward_fill(eeg)
+        
+            # handle 2D: (18, 4096) or (4096, 18)
+            if eeg.dim() == 2:
+                if eeg.shape[0] == 18 and eeg.shape[1] == 4096:
+                    eeg = eeg.unsqueeze(0)
+                elif eeg.shape[0] == 4096 and eeg.shape[1] == 18:
+                    eeg = eeg.t().unsqueeze(0)
+                else:
+                    if eeg.numel == 18 * 4096:
+                        eeg = eeg.view(1, 18, 4096)
+                    else:
+                        raise ValueError(f"Invalid 2D shape: {eeg.shape}")
+                
+            # handle 3D: (1, 18, 4096) or (1, 4096, 18)
+            elif eeg.dim() == 3:
+                if eeg.shape[0] == 1 and eeg.shape[1] == 18 and eeg.shape[2] == 4096:
+                    pass
+                elif eeg.shape[0] == 1 and eeg.shape[1] == 4096 and eeg.shape[2] == 18:
+                    eeg = eeg.transpose(1, 2)
+                elif eeg.shape[1] == 18 and eeg.shape[2] == 4096:
+                    eeg = eeg.unsqueeze(0) if eeg.shape[0] != 1 else eeg
+                else:
+                    raise ValueError(f"Unexpected 3D shape: {eeg.shape}")
+            else:
+                raise ValueError(f"Invalid dimension: {eeg.dim()}")
+
+
+            # aug block
+            if aug_params is None:
+                eeg = eeg[:, :, 1280:2816]
+            else:
+                aug_type = aug_params['type']
+                if aug_type == 'noise':
+                    eeg = add_gaussian_noise(eeg, aug_params['std'])
+                    eeg = eeg[:, :, 1280:2816]
+                elif aug_type == 'scale':
+                    eeg = random_scale(eeg, aug_params['scale_range'])
+                    eeg = eeg[:, :, 1280:2816]
+                elif aug_type == 'crop':
+                    start = aug_params['start']
+                    eeg = eeg[:, :, start:start + 1536]
+                else:
+                    eeg = eeg[:, :, 1280: 2816]
+
+            return eeg, label, patient, session
+        
+        except Exception as e:
+            print(f"Error loading {fpath}: {e}")
+            # Return a dummy tensor and placeholder values
+            return torch.zeros(1, 18, 1536), -1, patient, session 
+
+
+    def reset_fill_counter(self):
+        self.filled_count = 0
+    
+    def get_filled_count(self):
+        return self.filled_count
+    
+
+# Data Augmentation
+def add_gaussian_noise(eeg, std=0.01):
+    noise = torch.randn_like(eeg) * std
+    return eeg + noise
+
+def random_scale(eeg, scale_range=(0.8, 1.2)):
+    scale = torch.empty(1).uniform_(*scale_range).item()
+    return eeg * scale
+
+def random_center_crop(eeg, crop_length=1536, center_idx = 2048):
+    start = torch.randint(513, 2049, (1,)).item()
+    return eeg[:, :, start:start + crop_length]
+
+
+# Data Augmentation function
+def build_augmented_samples(base_samples, seizure_target, num_augmented, seed=42):
+    """
+    Augmentation data are based on orginal data, created a external augumentation set
+    base_samples --> orginal training set
+    seizure_target--> seizure samples for resampling
+    num_augmented --> total augmented data has been generated
+    """
+    import random
+    random.seed(seed)
+    torch.manual_seed(seed)
+
+    # split seizure and non-seizure
+    seizure_samples = [s for s in base_samples if s[4] == 1]
+    n_seizure = len(seizure_samples)
+    n_duplicate = max(0, seizure_target - n_seizure)
+
+    # resampple the sz samples
+    duplicated_seizure = []
+    if n_duplicate > 0 and n_seizure > 0:
+        choices = random.choices(seizure_samples, k=n_duplicate)  
+        for sample in choices:
+            duplicated_seizure.append(sample[:5] + (None,))
+
+    # augmentation samples
+    augmented = []
+    if num_augmented > 0:
+        total = len(base_samples)
+        if num_augmented <= total:
+            indices = random.sample(range(total), num_augmented)
+        else:
+            indices = random.choices(range(total), k=num_augmented)
+            print(f"Warning: num_augmented ({num_augmented}) > total samples ({total}), using replacement.")
+
+        for idx in indices:
+            sample = base_samples[idx]
+            aug_type = random.choice(['noise', 'scale', 'crop'])
+            if aug_type == 'noise':
+                aug_params = {'type': 'noise', 'std': 0.1}           
+            elif aug_type == 'scale':
+                aug_params = {'type': 'scale', 'scale_range': (0.7, 1.3)}   
+            else:  # crop
+                start = random.randint(1024, 2048)                   
+                aug_params = {'type': 'crop', 'start': start}
+            augmented.append(sample[:5] + (aug_params,))
+
+    # transfer orginal training set to non aug label
+    original = [s[:5] + (None,) for s in base_samples]
+
+    # pack
+    all_samples = original + duplicated_seizure + augmented
+    random.shuffle(all_samples)
+
+    print(f"Original samples: {len(original)} (seizure: {n_seizure})")
+    print(f"Duplicated seizure samples: {len(duplicated_seizure)} (target seizure total: {seizure_target})")
+    print(f"Augmented samples: {len(augmented)}")
+    print(f"Total training samples: {len(all_samples)}")
+    return all_samples
+
+
+
+def collate_fn(batch):
+    batch = [b for b in batch if b[1] != -1]
+    if len(batch) == 0:
+        return None
+    eegs = torch.stack([b[0] for b in batch])
+    labels = torch.tensor([b[1] for b in batch])
+    patients = [b[2] for b in batch]
+    sessions = [b[3] for b in batch]
+    return eegs, labels, patients, sessions
+
+
+def split_patients(label_dict, test_ratio=0.2, val_ratio=0.1, seed=42, n_splits=None):
+    session_keys = list(label_dict.keys())
+    session_labels = list(label_dict.values())
+
+    if n_splits is None:
+        train_val_keys, test_keys, train_val_labels, _ = train_test_split(
+            session_keys, session_labels, test_size=test_ratio,
+            stratify=session_labels, random_state=seed
+        )
+        val_ratio_adj = val_ratio / (1 - test_ratio)
+        train_keys, val_keys, _, _ = train_test_split(
+            train_val_keys, train_val_labels, test_size=val_ratio_adj,
+            stratify=train_val_labels, random_state=seed
+        )
+        print(
+            f"Train sessions: {len(train_keys)} (L: {sum(1 for k in train_keys if label_dict[k] == 0)}, R: {sum(1 for k in train_keys if label_dict[k] == 1)})")
+        print(
+            f"Val sessions: {len(val_keys)} (L: {sum(1 for k in val_keys if label_dict[k] == 0)}, R: {sum(1 for k in val_keys if label_dict[k] == 1)})")
+        print(
+            f"Test sessions: {len(test_keys)} (L: {sum(1 for k in test_keys if label_dict[k] == 0)}, R: {sum(1 for k in test_keys if label_dict[k] == 1)})")
+        return train_keys, val_keys, test_keys
+    else:
+        skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=seed)
+        folds = []
+        for fold_idx, (train_idx, val_idx) in enumerate(skf.split(session_keys, session_labels)):
+            train_sessions = [session_keys[i] for i in train_idx]
+            val_sessions = [session_keys[i] for i in val_idx]
+            print(
+                f"Fold {fold_idx+1}: train sessions {len(train_sessions)} (L: {sum(1 for s in train_sessions if label_dict[s] == 0)}, R: {sum(1 for s in train_sessions if label_dict[s] == 1)})")
+            print(
+                f"val sessions {len(val_sessions)} (L: {sum(1 for s in val_sessions if label_dict[s] == 0)}, R: {sum(1 for s in val_sessions if label_dict[s] == 1)})")
+            folds.append((train_sessions, val_sessions))
+        return folds
+
+
+def weights_for_sampling(dataset):
+    labels = [s[1] for s in dataset.samples]
+    class_counts = np.bincount(labels, minlength=2)
+    total = sum(class_counts)
+    weights = total / (2 * class_counts)
+    return torch.tensor(weights, dtype=torch.float32)
