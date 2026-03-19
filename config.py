@@ -26,4 +26,3 @@ VAL_RATIO = 0.1
 SEED = 42
 
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-
