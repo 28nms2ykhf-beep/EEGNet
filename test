@@ -1,85 +1,67 @@
-# main.py 中原有的训练和绘图代码保持不变...
-# ... 训练循环、保存最佳模型、绘制训练曲线 ...
+        # ... 前面的加载和维度处理代码保持不变 ...
 
-# 在原有绘图之后，添加新的评估和绘图
-model.load_state_dict(torch.load("best_model.pth"))
-model.to(config.DEVICE)
+        # 处理增强或默认裁剪
+        if aug_params is None:
+            # 原始样本：中心裁剪1536
+            T = eeg.shape[-1]
+            target_len = 1536
+            if T >= target_len:
+                start = (T - target_len) // 2
+                eeg = eeg[:, :, start:start + target_len]
+            else:
+                # 长度不足则右侧补零
+                pad = target_len - T
+                eeg = F.pad(eeg, (0, pad))
+        else:
+            aug_type = aug_params['type']
+            if aug_type == 'noise':
+                eeg = add_gaussian_noise(eeg, aug_params['std'])
+                # 噪声后仍需要统一裁剪（如果原始长度不是1536）
+                T = eeg.shape[-1]
+                if T != 1536:
+                    # 中心裁剪或填充
+                    if T > 1536:
+                        start = (T - 1536) // 2
+                        eeg = eeg[:, :, start:start+1536]
+                    else:
+                        pad = 1536 - T
+                        eeg = F.pad(eeg, (0, pad))
+            elif aug_type == 'scale':
+                eeg = random_scale(eeg, aug_params['scale_range'])
+                # 同样确保长度
+                T = eeg.shape[-1]
+                if T != 1536:
+                    if T > 1536:
+                        start = (T - 1536) // 2
+                        eeg = eeg[:, :, start:start+1536]
+                    else:
+                        pad = 1536 - T
+                        eeg = F.pad(eeg, (0, pad))
+            elif aug_type == 'crop':
+                start = aug_params['start']
+                T = eeg.shape[-1]
+                target_len = 1536
+                # 如果起始点+1536超出范围，则调整起始点
+                if start + target_len > T:
+                    start = max(0, T - target_len)
+                eeg = eeg[:, :, start:start + target_len]
+                # 如果长度不足（理论上不会，但保险）
+                if eeg.shape[-1] != target_len:
+                    pad = target_len - eeg.shape[-1]
+                    eeg = F.pad(eeg, (0, pad))
+            # 可选的 channel 增强（如果有）
+            elif aug_type == 'channel':
+                eeg = channel_dropout(eeg, aug_params['drop_prob'])
+                # 长度统一
+                T = eeg.shape[-1]
+                if T != 1536:
+                    if T > 1536:
+                        start = (T - 1536) // 2
+                        eeg = eeg[:, :, start:start+1536]
+                    else:
+                        pad = 1536 - T
+                        eeg = F.pad(eeg, (0, pad))
 
-# 调用详细评估函数
-labels, preds, probs, patients, sessions = evaluate_detailed(model, test_loader, config.DEVICE)
-
-# ---------- Sample 层面 ----------
-from sklearn.metrics import confusion_matrix, roc_auc_score, roc_curve
-import matplotlib.pyplot as plt
-import seaborn as sns
-import numpy as np
-from collections import defaultdict
-
-# 计算并绘制样本级混淆矩阵
-cm_sample = confusion_matrix(labels, preds)
-plt.figure(figsize=(5,5))
-sns.heatmap(cm_sample, annot=True, fmt='d', cmap='Blues')
-plt.title('Sample-level Confusion Matrix')
-plt.xlabel('Predicted')
-plt.ylabel('True')
-plt.show()
-
-# 样本级 ROC 曲线
-auc_sample = roc_auc_score(labels, probs)
-fpr, tpr, _ = roc_curve(labels, probs)
-plt.figure()
-plt.plot(fpr, tpr, label=f'Sample AUC = {auc_sample:.3f}')
-plt.plot([0,1],[0,1],'k--')
-plt.xlabel('False Positive Rate')
-plt.ylabel('True Positive Rate')
-plt.title('Sample-level ROC')
-plt.legend()
-plt.show()
-
-# ---------- Session 层面 ----------
-session_true = {}
-session_probs = defaultdict(list)
-session_votes = defaultdict(list)
-
-for true, pred, prob, pat, sess in zip(labels, preds, probs, patients, sessions):
-    key = (pat, sess)
-    session_true[key] = true   # session真实标签（所有样本应一致）
-    session_probs[key].append(prob)
-    session_votes[key].append(pred)
-
-# 聚合每个 session 的预测
-session_labels = []
-session_pred_probs = []
-session_pred_majority = []
-for key in session_true.keys():
-    true_label = session_true[key]
-    avg_prob = np.mean(session_probs[key])
-    majority = np.bincount(session_votes[key]).argmax()
-    session_labels.append(true_label)
-    session_pred_probs.append(avg_prob)
-    session_pred_majority.append(majority)
-
-# session级混淆矩阵
-cm_session = confusion_matrix(session_labels, session_pred_majority)
-plt.figure(figsize=(5,5))
-sns.heatmap(cm_session, annot=True, fmt='d', cmap='Greens')
-plt.title('Session-level Confusion Matrix')
-plt.xlabel('Predicted')
-plt.ylabel('True')
-plt.show()
-
-# session级 ROC 曲线
-auc_session = roc_auc_score(session_labels, session_pred_probs)
-fpr_s, tpr_s, _ = roc_curve(session_labels, session_pred_probs)
-plt.figure()
-plt.plot(fpr_s, tpr_s, label=f'Session AUC = {auc_session:.3f}')
-plt.plot([0,1],[0,1],'k--')
-plt.xlabel('False Positive Rate')
-plt.ylabel('True Positive Rate')
-plt.title('Session-level ROC')
-plt.legend()
-plt.show()
-
-# 可选：打印测试准确率（如果还想用原来的 test 函数打印）
-test_acc = test(model, test_loader, config.DEVICE)
-print(f"\nTest Accuracy (from original test function): {test_acc:.2f}%")
+        # 最终确保形状为 (1, 18, 1536)（可加断言）
+        assert eeg.shape == (1, 18, 1536), f"Shape mismatch: {eeg.shape}"
+        return eeg, label, patient, session
