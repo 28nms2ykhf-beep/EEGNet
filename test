@@ -1,28 +1,79 @@
-def evaluate_with_details(model, test_loader, device):
-    """返回样本级别的真实标签、预测标签、正类概率、病人和会话"""
-    model.eval()
-    all_labels = []
-    all_preds = []
-    all_probs = []
-    all_patients = []
-    all_sessions = []
+model.load_state_dict(torch.load("best_model.pth"))
+labels, preds, probs, patients, sessions = test(model, test_loader, config.DEVICE)
 
-    with torch.no_grad():
-        for batch in tqdm(test_loader, desc="Evaluating"):
-            if batch is None:
-                continue
-            eegs, labels, patients, sessions = batch
-            eegs = eegs.to(device)
-            labels = labels.to(device)
+from sklearn.metrics import confusion_matrix, roc_auc_score, roc_curve
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
 
-            outputs = model(eegs)
-            probs = torch.softmax(outputs, dim=1)
-            _, predicted = torch.max(outputs, 1)
+# ---------- Sample 层面 ----------
+cm_sample = confusion_matrix(labels, preds)
+print("Sample-level Confusion Matrix:\n", cm_sample)
 
-            all_labels.extend(labels.cpu().numpy())
-            all_preds.extend(predicted.cpu().numpy())
-            all_probs.extend(probs[:, 1].cpu().numpy())  # 正类概率
-            all_patients.extend(patients)
-            all_sessions.extend(sessions)
+# 绘制混淆矩阵
+plt.figure(figsize=(5,5))
+sns.heatmap(cm_sample, annot=True, fmt='d', cmap='Blues')
+plt.title('Sample-level Confusion Matrix')
+plt.xlabel('Predicted')
+plt.ylabel('True')
+plt.show()
 
-    return all_labels, all_preds, all_probs, all_patients, all_sessions
+# 计算 AUC 并绘制 ROC 曲线
+auc_sample = roc_auc_score(labels, probs)
+print(f"Sample-level AUC: {auc_sample:.4f}")
+fpr, tpr, _ = roc_curve(labels, probs)
+plt.plot(fpr, tpr, label=f'AUC = {auc_sample:.2f}')
+plt.plot([0,1],[0,1],'k--')
+plt.xlabel('False Positive Rate')
+plt.ylabel('True Positive Rate')
+plt.title('Sample-level ROC')
+plt.legend()
+plt.show()
+
+# ---------- Session 层面 ----------
+from collections import defaultdict
+
+session_true = {}
+session_probs = defaultdict(list)
+session_votes = defaultdict(list)
+
+for true, pred, prob, pat, sess in zip(labels, preds, probs, patients, sessions):
+    key = (pat, sess)
+    session_true[key] = true                     # session 的真实标签（所有样本应一致）
+    session_probs[key].append(prob)
+    session_votes[key].append(pred)
+
+# 聚合每个 session 的预测
+session_labels = []
+session_pred_probs = []
+session_pred_majority = []
+
+for key in session_true.keys():
+    true_label = session_true[key]
+    avg_prob = np.mean(session_probs[key])       # 平均概率
+    majority = np.bincount(session_votes[key]).argmax()  # 多数投票
+    session_labels.append(true_label)
+    session_pred_probs.append(avg_prob)
+    session_pred_majority.append(majority)
+
+# 计算 session 层面的混淆矩阵和 AUC
+cm_session = confusion_matrix(session_labels, session_pred_majority)
+print("\nSession-level Confusion Matrix:\n", cm_session)
+
+plt.figure(figsize=(5,5))
+sns.heatmap(cm_session, annot=True, fmt='d', cmap='Greens')
+plt.title('Session-level Confusion Matrix')
+plt.xlabel('Predicted')
+plt.ylabel('True')
+plt.show()
+
+auc_session = roc_auc_score(session_labels, session_pred_probs)
+print(f"Session-level AUC: {auc_session:.4f}")
+fpr_s, tpr_s, _ = roc_curve(session_labels, session_pred_probs)
+plt.plot(fpr_s, tpr_s, label=f'AUC = {auc_session:.2f}')
+plt.plot([0,1],[0,1],'k--')
+plt.xlabel('False Positive Rate')
+plt.ylabel('True Positive Rate')
+plt.title('Session-level ROC')
+plt.legend()
+plt.show()
