@@ -1,0 +1,28 @@
+def evaluate_with_details(model, test_loader, device):
+    """返回样本级别的真实标签、预测标签、正类概率、病人和会话"""
+    model.eval()
+    all_labels = []
+    all_preds = []
+    all_probs = []
+    all_patients = []
+    all_sessions = []
+
+    with torch.no_grad():
+        for batch in tqdm(test_loader, desc="Evaluating"):
+            if batch is None:
+                continue
+            eegs, labels, patients, sessions = batch
+            eegs = eegs.to(device)
+            labels = labels.to(device)
+
+            outputs = model(eegs)
+            probs = torch.softmax(outputs, dim=1)
+            _, predicted = torch.max(outputs, 1)
+
+            all_labels.extend(labels.cpu().numpy())
+            all_preds.extend(predicted.cpu().numpy())
+            all_probs.extend(probs[:, 1].cpu().numpy())  # 正类概率
+            all_patients.extend(patients)
+            all_sessions.extend(sessions)
+
+    return all_labels, all_preds, all_probs, all_patients, all_sessions
