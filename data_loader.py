@@ -7,6 +7,7 @@ import torch
 from torch.utils.data import Dataset
 from sklearn.model_selection import train_test_split, StratifiedKFold
 
+
 def load_labels(csv_path):
     """0 is left hemisphere, 1 is right hemisphere"""
     df = pd.read_csv(csv_path)
@@ -36,11 +37,12 @@ def load_labels(csv_path):
 
 
 class EEGDataset(Dataset):
-    def __init__(self, data_root, label_dict, samples_per_session=None, allowed_keys=None, samples_list=None):
+    def __init__(self, data_root, label_dict, samples_per_session=None, allowed_keys=None, samples_list=None, chunk_size = 2048):
         self.data_root = data_root
         self.label_dict = label_dict
         self.samples_per_session = samples_per_session
         self.allowed_keys = set(allowed_keys) if allowed_keys else None
+        self.chunk_size = chunk_size
         self.samples = []
         if samples_list is not None:
             self.samples = samples_list
@@ -153,21 +155,25 @@ class EEGDataset(Dataset):
 
 
             # aug block
+            crop_len = self.chunk_size
+            total_len = 4096
+            center_start = (total_len - crop_len)//2
+
             if aug_params is None:
-                eeg = eeg[:, :, 1280:2816]
+                eeg = eeg[:, :, center_start:center_start+crop_len]
             else:
                 aug_type = aug_params['type']
                 if aug_type == 'noise':
                     eeg = add_gaussian_noise(eeg, aug_params['std'])
-                    eeg = eeg[:, :, 1280:2816]
+                    eeg = eeg[:, :, center_start:center_start+crop_len]
                 elif aug_type == 'scale':
                     eeg = random_scale(eeg, aug_params['scale_range'])
-                    eeg = eeg[:, :, 1280:2816]
+                    eeg = eeg[:, :, center_start:center_start+crop_len]
                 elif aug_type == 'crop':
                     start = aug_params['start']
-                    eeg = eeg[:, :, start:start + 1536]
+                    eeg = eeg[:, :, center_start:center_start+crop_len]
                 else:
-                    eeg = eeg[:, :, 1280: 2816]
+                    eeg = eeg[:, :, center_start:center_start+crop_len]
 
             return eeg, label, patient, session
         
@@ -236,11 +242,14 @@ def build_augmented_samples(base_samples, seizure_target, num_augmented, seed=42
             sample = base_samples[idx]
             aug_type = random.choice(['noise', 'scale', 'crop'])
             if aug_type == 'noise':
-                aug_params = {'type': 'noise', 'std': 0.01}           
+                aug_params = {'type': 'noise', 'std': 0.1}           
             elif aug_type == 'scale':
-                aug_params = {'type': 'scale', 'scale_range': (0.8, 1.2)}   
+                aug_params = {'type': 'scale', 'scale_range': (0.7, 1.3)}   
             else:  # crop
-                start = random.randint(1024, 2048)                   
+                total_len = 4096
+                crop_len = 2048
+                max_start = total_len - crop_len
+                start = random.randint(0, max_start)                   
                 aug_params = {'type': 'crop', 'start': start}
             augmented.append(sample[:5] + (aug_params,))
 
