@@ -14,3 +14,4 @@ def create_eegnet(chunk_size, num_electrodes, F1, F2, D, num_classes,
                    dropout=dropout)
     
     return model
+                    
