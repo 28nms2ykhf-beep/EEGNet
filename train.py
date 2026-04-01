@@ -84,3 +84,32 @@ def test(model, test_loader, device):
 
     acc = 100.0 * test_correct / test_total
     return acc
+
+
+def evaluate_detailed(model, test_loader, device):
+    model.eval()
+    all_labels = []
+    all_preds = []
+    all_probs = []
+    all_patients = []
+    all_sessions = []
+
+    with torch.no_grad():
+        for batch in tqdm(test_loader, desc="Evaluating"):
+            if batch is None:
+                continue
+            eegs, labels, patients, sessions = batch
+            eegs = eegs.to(device)
+            labels = labels.to(device)
+
+            outputs = model(eegs)
+            probs = torch.softmax(outputs, dim=1)
+            _, predicted = torch.max(outputs, 1)
+
+            all_labels.extend(labels.cpu().numpy())
+            all_preds.extend(predicted.cpu().numpy())
+            all_probs.extend(probs[:, 1].cpu().numpy()) 
+            all_patients.extend(patients)
+            all_sessions.extend(sessions)
+
+    return all_labels, all_preds, all_probs, all_patients, all_sessions
