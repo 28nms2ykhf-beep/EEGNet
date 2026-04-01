@@ -10,7 +10,7 @@ from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 import config
 from data_loader import load_labels, EEGDataset, collate_fn, split_patients, build_augmented_samples
 from model import create_eegnet
-from train import train_one_epoch, validate, test
+from train import train_one_epoch, validate, test, evaluate_detailed
 
 
 def main():
@@ -34,18 +34,21 @@ def main():
     augmented_samples = build_augmented_samples(
         base_samples=train_dataset_original.samples,
         seizure_target=1000,      
-        num_augmented=5000,       
+        num_augmented=40000,       
         seed=config.SEED
     )
     
     train_dataset = EEGDataset(config.DATA_ROOT, label_dict,
-                               samples_list=augmented_samples)
+                               samples_list=augmented_samples,
+                               chunk_size=config.CHUNK_SIZE)
     val_dataset = EEGDataset(config.DATA_ROOT, label_dict,
                              samples_per_session=config.SAMPLES_PER_SESSION,
-                             allowed_keys=val_keys)
+                             allowed_keys=val_keys,
+                             chunk_size=config.CHUNK_SIZE)
     test_dataset = EEGDataset(config.DATA_ROOT, label_dict,
                               samples_per_session=config.SAMPLES_PER_SESSION,
-                              allowed_keys=test_keys)
+                              allowed_keys=test_keys,
+                              chunk_size=config.CHUNK_SIZE)
 
     print(f"Train dataset size: {len(train_dataset)}")
     print(f"Val dataset size: {len(val_dataset)}")
@@ -89,7 +92,7 @@ def main():
                                   lr=config.LEARNING_RATE,
                                   weight_decay=config.WEIGHT_DECAY)
     total_epochs = config.EPOCHS
-    warmup_epochs = 10
+    warmup_epochs = 5
 
     # warmup round: 0.01x --> 1x
     warmup_scheduler = LinearLR(optimizer, start_factor=0.01, end_factor=1.0, total_iters=warmup_epochs)
@@ -98,7 +101,8 @@ def main():
     cosine_scheduler = CosineAnnealingLR(optimizer, T_max=total_epochs - warmup_epochs, eta_min=5e-5)
     
     scheduler = SequentialLR(optimizer, schedulers=[warmup_scheduler, cosine_scheduler], milestones=[warmup_epochs])
- 
+    
+
     # 7. training
     best_val_acc = 0.0
     patience_counter = 0
@@ -141,7 +145,81 @@ def main():
     test_acc = test(model, test_loader, config.DEVICE)
     print(f"\ntest acc: {test_acc:.2f}%")
 
-  
+    
+    labels, preds, probs, patients, sessions = evaluate_detailed(model, test_loader, config.DEVICE)
+
+    from sklearn.metrics import confusion_matrix, roc_auc_score, roc_curve
+    import numpy as np
+    from collections import defaultdict
+
+    # sample confusion matrix
+    cm_sample = confusion_matrix(labels, preds)
+    plt.figure(figsize=(5,5))
+    sns.heatmap(cm_sample, annot=True, fmt='d', cmap='Blues')
+    plt.title('Sample-level Confusion Matrix')
+    plt.xlabel('Predicted')
+    plt.ylabel('True')
+    plt.show()
+
+    #sample ROC
+    auc_sample = roc_auc_score(labels, probs)
+    fpr, tpr, _ = roc_curve(labels, probs)
+    plt.figure()
+    plt.plot(fpr, tpr, label=f'Sample AUC = {auc_sample:.3f}')
+    plt.plot([0,1],[0,1],'k--')
+    plt.xlabel('False Positive Rate')
+    plt.ylabel('True Positive Rate')
+    plt.title('Sample-level ROC')
+    plt.legend()
+    plt.show()
+
+    #session level
+    session_true = {}
+    session_probs = defaultdict(list)
+    session_votes = defaultdict(list)
+
+    for true, pred, prob, pat, sess in zip(labels, preds, probs, patients, sessions):
+        key = (pat, sess)
+        session_true[key] = true  
+        session_probs[key].append(prob)
+        session_votes[key].append(pred)
+
+    session_labels = []
+    session_pred_probs = []
+    session_pred_majority = []
+
+    for key in session_true.keys():
+        true_label = session_true[key]
+        avg_prob = np.mean(session_probs[key])
+        majority = np.bincount(session_votes[key]).argmax()
+        session_labels.append(true_label)
+        session_pred_probs.append(avg_prob)
+        session_pred_majority.append(majority)
+
+    # session confusion matrix
+    cm_session = confusion_matrix(session_labels, session_pred_majority)
+    plt.figure(figsize=(5,5))
+    sns.heatmap(cm_session, annot=True, fmt='d', cmap='Greens')
+    plt.title('Session-level Confusion Matrix')
+    plt.xlabel('Predicted')
+    plt.ylabel('True')
+    plt.show()
+
+    # session ROC
+    auc_session = roc_auc_score(session_labels, session_pred_probs)
+    fpr_s, tpr_s, _ = roc_curve(session_labels, session_pred_probs)
+    plt.figure()
+    plt.plot(fpr_s, tpr_s, label=f'Session AUC = {auc_session:.3f}')
+    plt.plot([0,1],[0,1],'k--')
+    plt.xlabel('False Positive Rate')
+    plt.ylabel('True Positive Rate')
+    plt.title('Session-level ROC')
+    plt.legend()
+    plt.show()
+
+    test_acc = test(model, test_loader, config.DEVICE)
+    print(f"\nTest Accuracy (from original test function): {test_acc:.2f}%")
+    
     # plotting training cureve
     sns.set_theme(style="darkgrid", palette='muted')
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
